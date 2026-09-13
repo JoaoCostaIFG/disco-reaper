@@ -2,7 +2,7 @@ import asyncio
 import io
 import logging
 from typing import Optional, List, Dict, Any
-from fluxer import Bot, Webhook, Forbidden, File
+from fluxer import Bot, Webhook, Forbidden, File, NotFound, Unauthorized
 
 logger = logging.getLogger(__name__)
 
@@ -262,21 +262,16 @@ class FluxerWriter:
                 logger.warning(f"Fluxer: Timeout waiting for bot readiness.")
                 pass
 
-        # Use webhook for avatar/username spoofing
-        logger.debug(f"Fluxer: Resolving webhook for channel {channel_id}...")
-        webhook = await self._get_or_create_webhook(channel_id)
-        logger.debug(f"Fluxer: Webhook resolved: {webhook.id if webhook else 'None'}")
-        
         # Prepare content with subtext timestamp
         # -# is Fluxer/Discord's subtext markdown: small, muted grey text
         prefix = f"-# <t:{timestamp}:D>\n"
         if is_forwarded:
             prefix += "-# ⮫*forwarded*\n"
-            
+
         display_content = content
         if is_forwarded and content:
             display_content = f">>> {content}"
-            
+
         final_content = prefix + display_content if display_content else prefix
         logger.debug(f"Fluxer: Prepared final_content (len {len(final_content)}): {final_content!r}")
 
@@ -293,82 +288,173 @@ class FluxerWriter:
                 d = e.to_dict() if hasattr(e, "to_dict") else e
                 if not isinstance(d, dict):
                     continue
-                
+
                 # Heuristic: Skip redundant link previews to avoid "Invalid Embed" errors or duplication.
                 # If an embed has a URL that is already in the message content, and no complex fields, skip it.
                 if content and d.get("url") and str(d.get("url")) in content:
                     if not d.get("fields") and not d.get("description") and not d.get("title"):
                         logger.debug(f"Fluxer: Skipping redundant link preview embed for {d.get('url')}")
                         continue
-                
+
                 normalized_embeds.append(d)
         if not normalized_embeds: normalized_embeds = None
 
-        try:
-            # Current limitation: fluxer.py execute_webhook doesn't support 'message_reference' yet.
-            # So if we have a reply, we MUST use the bot's direct send method.
-            if webhook and not reply_to_message_id:
-                logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}'")
-                try:
-                    msg = await asyncio.wait_for(
-                        webhook.send(
-                            content=final_content,
-                            username=f"{author_name} (discord)",
-                            avatar_url=author_avatar_url,
-                            files=fluxer_files,
-                            embeds=normalized_embeds,
-                            wait=True
-                        ),
-                        timeout=45.0 # Increased timeout for potential large file uploads
-                    )
-                    logger.debug(f"Fluxer: Webhook send complete, msg_id={msg.id if msg else 'None'}")
-                    return str(msg.id) if msg else None
-                except asyncio.TimeoutError:
-                    print(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
-                    logger.error(f"Fluxer: Webhook send timed out after 45s for channel {channel_id}")
-                    return None
-            else:
-                # Use bot direct message (supports files and message_reference)
-                # We add the author name to the prefix since bot name won't match
-                bot_prefix = f"-# <t:{timestamp}:D>\n"
-                if is_forwarded:
-                    bot_prefix += "-# ⮫*forwarded*\n"
-                bot_prefix += f"-# · {author_name}\n"
-                
-                final_bot_content = bot_prefix + display_content if display_content else bot_prefix
-                
-                message_reference = None
-                if reply_to_message_id:
-                    message_reference = {"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
+        # Webhook path gives avatar/username spoofing, but replies must use the
+        # bot path because fluxer.py execute_webhook doesn't support message_reference.
+        if not reply_to_message_id:
+            sent, msg_id = await self._send_via_webhook(
+                channel_id=channel_id,
+                author_name=author_name,
+                final_content=final_content,
+                author_avatar_url=author_avatar_url,
+                fluxer_files=fluxer_files,
+                normalized_embeds=normalized_embeds,
+            )
+            if sent:
+                return msg_id
+            logger.warning(f"Fluxer: Webhook send failed for channel {channel_id}; falling back to direct bot send")
 
-                logger.debug(f"Fluxer: Sending message via bot for user '{author_name}'")
-                try:
-                    kwargs = {
-                        "channel_id": channel_id,
-                        "content": final_bot_content,
-                        "embeds": normalized_embeds
-                    }
-                    if fluxer_files:
-                        kwargs["files"] = fluxer_files
-                    if message_reference:
-                        kwargs["message_reference"] = message_reference
+        return await self._send_via_bot(
+            channel_id=channel_id,
+            author_name=author_name,
+            display_content=display_content,
+            timestamp=timestamp,
+            is_forwarded=is_forwarded,
+            fluxer_files=fluxer_files,
+            normalized_embeds=normalized_embeds,
+            reply_to_message_id=reply_to_message_id,
+        )
 
-                    msg_data = await asyncio.wait_for(
-                        self.client.send_message(**kwargs),
-                        timeout=45.0
-                    )
-                    logger.debug(f"Fluxer: Bot send complete, msg_id={msg_data.get('id') if msg_data else 'None'}")
-                    return str(msg_data["id"]) if msg_data else None
-                except asyncio.TimeoutError:
-                    print(f"Fluxer: Bot send timed out after 45s for channel {channel_id}")
-                    logger.error(f"Fluxer: Bot send timed out after 45s for channel {channel_id}")
+    async def _send_via_webhook(
+        self,
+        channel_id: str,
+        author_name: str,
+        final_content: str,
+        author_avatar_url: Optional[str],
+        fluxer_files: Optional[List["File"]],
+        normalized_embeds: Optional[List[Dict[str, Any]]],
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Sends a message via the channel webhook with retries for transient errors.
+        Fluxer's API returns 503s under high traffic; fluxer.py only retries ~10s
+        internally before raising RuntimeError, so we retry with longer backoff and
+        re-create the webhook if it became stale (deleted/revoked).
+        Returns (sent, message_id).
+        """
+        assert self.client is not None
+
+        total_attempts = 3
+        for attempt in range(1, total_attempts + 1):
+            webhook = await self._get_or_create_webhook(channel_id)
+            if webhook is None:
+                # Could not resolve/create a webhook; let the caller fall back
+                return False, None
+
+            try:
+                logger.debug(f"Fluxer: Sending message via webhook {webhook.id} for user '{author_name}' (attempt {attempt}/{total_attempts})")
+                msg = await asyncio.wait_for(
+                    webhook.send(
+                        content=final_content,
+                        username=f"{author_name} (discord)",
+                        avatar_url=author_avatar_url,
+                        files=fluxer_files,
+                        embeds=normalized_embeds,
+                        wait=True
+                    ),
+                    timeout=45.0 # Increased timeout for potential large file uploads
+                )
+                logger.debug(f"Fluxer: Webhook send complete, msg_id={msg.id if msg else 'None'}")
+                return True, (str(msg.id) if msg else None)
+            except asyncio.TimeoutError:
+                logger.error(f"Fluxer: Webhook send timed out after 45s for channel {channel_id} (attempt {attempt}/{total_attempts})")
+            except (NotFound, Unauthorized, Forbidden) as e:
+                # Webhook was deleted or its token was revoked mid-migration:
+                # invalidate the cached webhook so it gets re-created on the next attempt
+                logger.warning(f"Fluxer: Webhook for channel {channel_id} is invalid ({e}); re-creating (attempt {attempt}/{total_attempts})")
+                self._webhooks.pop(channel_id, None)
+            except Exception as e:
+                # fluxer.py raises RuntimeError("Failed after N attempts: ...") once it
+                # exhausts its internal retries on 5xx (e.g. 503) or connection errors.
+                err_msg = f"Failed to copy message to Fluxer via webhook: {e}"
+                if hasattr(e, 'errors') and e.errors:
+                    err_msg += f" - Details: {e.errors}"
+                logger.error(err_msg)
+
+            if attempt < total_attempts:
+                delay = 10.0 * attempt
+                logger.warning(f"Fluxer: Retrying webhook send for channel {channel_id} in {delay:.0f}s (attempt {attempt + 1}/{total_attempts})")
+                await asyncio.sleep(delay)
+
+        return False, None
+
+    async def _send_via_bot(
+        self,
+        channel_id: str,
+        author_name: str,
+        display_content: Optional[str],
+        timestamp: int,
+        is_forwarded: bool,
+        fluxer_files: Optional[List["File"]],
+        normalized_embeds: Optional[List[Dict[str, Any]]],
+        reply_to_message_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Sends a message directly as the bot (supports files and message_reference)
+        with retries for transient (5xx/timeout) errors.
+        """
+        assert self.client is not None
+
+        # We add the author name to the prefix since bot name won't match
+        bot_prefix = f"-# <t:{timestamp}:D>\n"
+        if is_forwarded:
+            bot_prefix += "-# ⮫*forwarded*\n"
+        bot_prefix += f"-# · {author_name}\n"
+
+        final_bot_content = bot_prefix + display_content if display_content else bot_prefix
+
+        message_reference = None
+        if reply_to_message_id:
+            message_reference = {"message_id": str(reply_to_message_id), "channel_id": str(channel_id)}
+
+        total_attempts = 3
+        for attempt in range(1, total_attempts + 1):
+            try:
+                kwargs = {
+                    "channel_id": channel_id,
+                    "content": final_bot_content,
+                    "embeds": normalized_embeds
+                }
+                if fluxer_files:
+                    # HTTPClient.send_message expects dicts ({"filename", "data"}),
+                    # not File objects — only Webhook.send accepts File objects
+                    kwargs["files"] = [f.to_dict() for f in fluxer_files]
+                if message_reference:
+                    kwargs["message_reference"] = message_reference
+
+                logger.debug(f"Fluxer: Sending message via bot for user '{author_name}' (attempt {attempt}/{total_attempts})")
+                msg_data = await asyncio.wait_for(
+                    self.client.send_message(**kwargs),
+                    timeout=45.0
+                )
+                logger.debug(f"Fluxer: Bot send complete, msg_id={msg_data.get('id') if msg_data else 'None'}")
+                return str(msg_data["id"]) if msg_data else None
+            except asyncio.TimeoutError:
+                logger.error(f"Fluxer: Bot send timed out after 45s for channel {channel_id} (attempt {attempt}/{total_attempts})")
+            except Exception as e:
+                err_msg = f"Failed to copy message to Fluxer via bot: {e}"
+                if hasattr(e, 'errors') and e.errors:
+                    err_msg += f" - Details: {e.errors}"
+                logger.error(err_msg)
+                if not isinstance(e, RuntimeError):
+                    # Permanent error (4xx): retrying won't help
                     return None
-        except Exception as e:
-            err_msg = f"Failed to copy message to Fluxer: {e}"
-            if hasattr(e, 'errors') and e.errors:
-                err_msg += f" - Details: {e.errors}"
-            logger.error(err_msg)
-            return None
+
+            if attempt < total_attempts:
+                delay = 10.0 * attempt
+                logger.warning(f"Fluxer: Retrying bot send for channel {channel_id} in {delay:.0f}s (attempt {attempt + 1}/{total_attempts})")
+                await asyncio.sleep(delay)
+
+        return None
 
     async def send_marker(self, channel_id: str, content: str, files: list[dict] | None = None, reply_to_message_id: Optional[str] = None) -> Optional[str]:
         """
@@ -378,7 +464,12 @@ class FluxerWriter:
         
         fluxer_files = None
         if files:
-            fluxer_files = [f if hasattr(f, "filename") else File(io.BytesIO(f["data"]), filename=f["filename"]) for f in files]
+            # HTTPClient.send_message expects dicts ({"filename", "data"}),
+            # not File objects — only Webhook.send accepts File objects
+            fluxer_files = [
+                f.to_dict() if hasattr(f, "to_dict") else f
+                for f in files
+            ]
         
         message_reference = None
         if reply_to_message_id:
