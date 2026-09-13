@@ -75,6 +75,7 @@ class ProgressScreen(Screen[None]):
     .action_row { height: auto; layout: horizontal; }
     .action_row Button { width: 1fr; margin: 0 1; }
     #prog_actions_row1, #prog_actions_row2 { display: none; }
+    #btn_next_channel { display: none; }
     #footer_rule { margin: 0; }
     """
 
@@ -109,6 +110,7 @@ class ProgressScreen(Screen[None]):
                         yield Button("Continue Migration", id="btn_continue", disabled=True, variant="success", tooltip="Resume the operation from the last saved state")
                         yield Button("Start from ID", id="btn_start_id", disabled=True, variant="warning", tooltip="Start or resume from a specific Discord Message ID")
                     with Horizontal(classes="action_row", id="prog_actions_row2"):
+                        yield Button("Next Channel", id="btn_next_channel", variant="primary")
                         yield Button("Back", id="btn_back", disabled=False)
                         yield Button("Main Menu", id="btn_main_menu", disabled=False)
                     with Horizontal(classes="action_row", id="prog_actions_cancel"):
@@ -179,7 +181,7 @@ class ProgressScreen(Screen[None]):
             return
 
         # If operation is done (report phase), just dismiss with the action
-        if btn_id in ["btn_back", "btn_main_menu"]:
+        if btn_id in ["btn_back", "btn_main_menu", "btn_next_channel"]:
             if self.timer_event:
                 self.timer_event.stop()
             self.dismiss(btn_id)
@@ -363,7 +365,7 @@ class ProgressScreen(Screen[None]):
         try: self.query_one("#info_new_items", Label).display = False
         except Exception: pass
 
-    def phase_report(self, operation_name: str, status: str = "complete", show_back: bool = True):
+    def phase_report(self, operation_name: str, status: str = "complete", show_back: bool = True, next_channel_name: str | None = None):
         """Phase 4: Operation is done. Show Back + Main Menu.
         
         status can be: 'complete', 'stopped', 'error'
@@ -410,6 +412,18 @@ class ProgressScreen(Screen[None]):
                 menu_btn.variant = "success"
             else:
                 menu_btn.variant = "warning"
+        except Exception:
+            pass
+
+        try:
+            next_btn = self.query_one("#btn_next_channel", Button)
+            if next_channel_name:
+                next_btn.label = f"Migrate #{next_channel_name}"
+                next_btn.tooltip = "Migrate the next text channel from the list"
+                next_btn.display = True
+                next_btn.disabled = False
+            else:
+                next_btn.display = False
         except Exception:
             pass
 
@@ -533,7 +547,46 @@ class OptionSelectModal(ModalScreen[list[str]]):
 # ChannelPickerModal – single-channel selection (shuttle)
 # ---------------------------------------------------------------------------
 
-class ChannelPickerScreen(Screen[tuple]):
+def _category_sort_key(cat_id, categories: dict) -> str:
+    return categories.get(cat_id, "") if cat_id else ""
+
+
+def group_channels_by_category(channels: list, categories: dict) -> list[tuple[Any, list]]:
+    """Group channels by category in picker display order (uncategorized first,
+    then categories alphabetically by name). Deduplicates by channel id."""
+    cat_grouped: dict[Any, list] = {}
+    seen_ids: set = set()
+    for c in channels:
+        cat_id = getattr(c, "category_id", None) if not isinstance(c, dict) else c.get("parent_id")
+        cid = c.get("id") if isinstance(c, dict) else c.id
+        if cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        cat_grouped.setdefault(cat_id, []).append(c)
+    return [
+        (cat_id, cat_grouped[cat_id])
+        for cat_id in sorted(cat_grouped, key=lambda k: _category_sort_key(k, categories))
+    ]
+
+
+def order_channels_for_display(channels: list, categories: dict) -> list:
+    """Flat channel list in the exact order rendered by ChannelPickerScreen."""
+    return [c for _, chans in group_channels_by_category(channels, categories) for c in chans]
+
+
+# Prefix shown before already-migrated channels in the picker source list
+MIGRATED_MARK = "[green]✓[/green] "
+
+
+def strip_migrated_mark(prompt: str) -> str:
+    """Channel name from an option prompt, without the migrated checkmark."""
+    text = str(prompt)
+    if text.startswith(MIGRATED_MARK):
+        text = text[len(MIGRATED_MARK):]
+    return text.strip()
+
+
+class ChannelPickerScreen(Screen[tuple | str]):
     """Screen listing Discord channels (left) and Target platforms channels (right) for dual selection."""
 
     DEFAULT_CSS = """
@@ -589,7 +642,7 @@ class ChannelPickerScreen(Screen[tuple]):
     #chanpick_buttons Button { width: 1fr; margin: 0 1; }
     """
 
-    def __init__(self, src_channels: list, src_cat_map: dict, tgt_channels: list, tgt_cat_map: dict, tgt_name: str = "Fluxer", all_tgt_channels: list | None = None):
+    def __init__(self, src_channels: list, src_cat_map: dict, tgt_channels: list, tgt_cat_map: dict, tgt_name: str = "Fluxer", all_tgt_channels: list | None = None, preselect_src_id: int | str | None = None, migrated_ids: set | None = None):
         super().__init__()
         self.src_channels = src_channels
         self.src_cat_map = src_cat_map
@@ -597,31 +650,25 @@ class ChannelPickerScreen(Screen[tuple]):
         self.tgt_cat_map = tgt_cat_map
         self.tgt_name = tgt_name
         self.all_tgt_channels = all_tgt_channels or tgt_channels
+        self.preselect_src_id = preselect_src_id
+        self.migrated_ids = {str(x) for x in (migrated_ids or [])}
 
     def _render_pane(self, channels, categories, pane_id, prefix):
-        cat_grouped: dict[int | None, list] = {}
-        seen_ids = set()
-        for c in channels:
-            cat_id = getattr(c, "category_id", None) if not isinstance(c, dict) else c.get("parent_id")
-            cid = c.get("id") if isinstance(c, dict) else c.id
-            if cid in seen_ids:
-                continue
-            seen_ids.add(cid)
-            cat_grouped.setdefault(cat_id, []).append(c)
-
         options = []
-        for cat_id in sorted(cat_grouped, key=lambda k: categories.get(k, "") if k else ""):
+        for cat_id, chans in group_channels_by_category(channels, categories):
             if cat_id is not None and cat_id in categories:
                 # Category header as a bold, non-selectable option
                 options.append(Option(f"[bold cyan]{categories[cat_id]}[/bold cyan]", id=f"header_{cat_id}", disabled=True))
-            
-            for c in cat_grouped[cat_id]:
+
+            for c in chans:
                 if isinstance(c, dict):
                     name = c.get("name", "Unnamed")
                     cid = c.get("id")
                 else:
                     name = c.name
                     cid = c.id
+                if prefix == "src" and str(cid) in self.migrated_ids:
+                    name = f"{MIGRATED_MARK}{name}"
                 options.append(Option(name, id=f"{prefix}_{cid}"))
         
         # Add "Extras" category to the target pane only
@@ -649,6 +696,7 @@ class ChannelPickerScreen(Screen[tuple]):
                 yield Rule(id="footer_rule")
                 with Horizontal(id="chanpick_buttons"):
                     yield Button("Select", variant="success", id="btn_pick_ok", tooltip="Confirm selection and start migration")
+                    yield Button("Migrate All Channels", variant="warning", id="btn_pick_all", tooltip="Automatically migrate every text channel, one by one\n(targets matched by existing mapping or channel name;\nalready-migrated channels resume from last message)")
                     yield Button("Back", id="btn_pick_back", tooltip="Cancel selection")
         yield Footer()
         yield RamDisplay()
@@ -665,24 +713,48 @@ class ChannelPickerScreen(Screen[tuple]):
                         lst.highlighted = i
                         break
 
+        if self.preselect_src_id is not None:
+            self._highlight_src_channel(self.preselect_src_id)
+            self._auto_match_target()
+
+    def _highlight_src_channel(self, src_id: int | str) -> None:
+        src_list = self.query_one("#src_list", OptionList)
+        for i in range(src_list.option_count):
+            opt = src_list.get_option_at_index(i)
+            if opt.id == f"src_{src_id}":
+                src_list.highlighted = i
+                src_list.scroll_to_highlight()
+                return
+
+    def _auto_match_target(self) -> None:
+        """QoL: Auto-highlight the target channel matching the highlighted source."""
+        src_list = self.query_one("#src_list", OptionList)
+        if src_list.highlighted is None:
+            return
+        src_opt = src_list.get_option_at_index(src_list.highlighted)
+        if not src_opt.id or not src_opt.id.startswith("src_"):
+            return
+        src_name = strip_migrated_mark(src_opt.prompt).lower()
+        tgt_list = self.query_one("#tgt_list", OptionList)
+
+        for i in range(tgt_list.option_count):
+            opt = tgt_list.get_option_at_index(i)
+            if opt.id and opt.id.startswith("tgt_"):
+                if str(opt.prompt).strip().lower() == src_name:
+                    tgt_list.highlighted = i
+                    tgt_list.scroll_to_highlight()
+                    break
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         """Handle selection in either list."""
         if event.option_list.id == "src_list":
-            # QoL: Auto-select target if name matches
-            src_name = str(event.option.prompt).strip().lower()
-            tgt_list = self.query_one("#tgt_list", OptionList)
-            
-            for i in range(tgt_list.option_count):
-                opt = tgt_list.get_option_at_index(i)
-                if opt.id and opt.id.startswith("tgt_"):
-                    if str(opt.prompt).strip().lower() == src_name:
-                        tgt_list.highlighted = i
-                        tgt_list.scroll_to_highlight()
-                        break
+            self._auto_match_target()
 
     def on_button_pressed(self, event: Button.Pressed):
         if event.button.id == "btn_pick_back":
             self.dismiss(None)
+        elif event.button.id == "btn_pick_all":
+            self.dismiss("migrate_all")
         elif event.button.id == "btn_pick_ok":
             src_list = self.query_one("#src_list", OptionList)
             tgt_list = self.query_one("#tgt_list", OptionList)

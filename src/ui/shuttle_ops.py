@@ -23,7 +23,7 @@ from src.core.audit import log_audit_event
 from src.core.exporter import DiscordExporter
 from src.ui.modals import (
     ProgressScreen, SubMenuModal, ChannelPickerScreen, OptionSelectModal, MessageIDInputModal,
-    ChannelSelectScreen
+    ChannelSelectScreen, order_channels_for_display
 )
 
 import src.fluxer.roles_permissions as fluxer_roles
@@ -1187,6 +1187,131 @@ class OperationPane(Container):
             
         modal.write("\n[bold green]Automated channel migration complete.[/bold green]")
 
+    async def _logic_migrate_all_channels(self, modal: ProgressScreen, d_channels: list, f_channels: list, platform_name: str, migrate_mod) -> None:
+        """Migrate every text channel one by one, matching targets by mapping or name."""
+        modal.show_info("[bold cyan]Bulk Channel Migration[/bold cyan]", f"Migrating all {len(d_channels)} text channels, one by one.")
+        modal.show_stats()
+        modal.phase_progress()
+        modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
+
+        modal.write(f"[bold cyan]Bulk Migration: {len(d_channels)} text channels queued.[/bold cyan]\n")
+
+        # Ensure state database exists for mapping/progress lookups
+        tid = self.engine.config.fluxer_server_id if self.target_platform == "fluxer" else self.engine.config.stoat_server_id
+        tgt_server_info = await self.engine.writer.validate()
+        self.engine.ensure_state_initialized(str(tid or ""), tgt_server_info.get("community_name", "target community"))
+
+        completed, skipped, failed = 0, 0, 0
+        interrupted = False
+        self.engine.is_running = True
+
+        for i, source_channel in enumerate(d_channels):
+            if not self.engine.is_running:
+                interrupted = True
+                modal.write("\n[bold yellow]Bulk migration interrupted by user.[/bold yellow]")
+                break
+
+            # Resolve target: existing mapping first, then name match
+            tgt_id = self.engine.state.get_target_channel_id(str(source_channel.id))
+            target_channel = next((c for c in f_channels if str(c.get("id")) == str(tgt_id)), None) if tgt_id else None
+            if target_channel is None:
+                target_channel = next(
+                    (c for c in f_channels if str(c.get("name")).lower() == str(source_channel.name).lower()), None
+                )
+
+            if target_channel is None:
+                skipped += 1
+                modal.write(f"[yellow]Skipping #{source_channel.name} (no matching target channel found)[/yellow]")
+                continue
+
+            modal.write(f"\n[bold cyan]Channel {i + 1}/{len(d_channels)}:[/bold cyan] Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]")
+
+            # Already migrated before -> Continue Migration (resume after last message);
+            # otherwise -> Start from First (clean sink)
+            after_id = None
+            last_migrated = self.engine.state.get_last_message_id(str(target_channel.get("id")))
+            if last_migrated:
+                try:
+                    after_id = int(last_migrated)
+                except (TypeError, ValueError):
+                    logger.warning(f"Invalid last message ID '{last_migrated}' for #{source_channel.name}; starting from first.")
+                    after_id = None
+            if after_id:
+                modal.write(f"[yellow]Previous migration detected — Continue Migration after message {after_id}[/yellow]")
+            else:
+                self.engine.state.clear_channel_data(target_channel.get("id"))
+
+            try:
+                modal.set_status(f"Analyzing [cyan]#{source_channel.name}[/cyan] ({i + 1}/{len(d_channels)})...")
+                stats = await migrate_mod.analyze_migration(
+                    self.engine,
+                    source_channel_id=source_channel.id,
+                    after_message_id=after_id,
+                )
+                ch_total = stats["messages"]
+                modal.update_stats(messages=str(ch_total), threads=str(stats["threads"]), files=str(stats["attachments"]))
+
+                if ch_total == 0:
+                    modal.write(f"[green]#{source_channel.name} is already up to date.[/green]")
+                    completed += 1
+                    continue
+
+                async def update_indiv(curr, ch_name=source_channel.name, total=ch_total):
+                    c = curr["messages"]
+                    modal.set_progress(c, total or 100)
+                    modal.set_item_status(f"#{ch_name}: {c}/{total} messages")
+                    content = curr.get("last_message_content", "")
+                    author = curr.get("last_message_author", "Unknown")
+                    if content:
+                        disp = (content[:100] + '...') if len(content) > 100 else content
+                        modal.write(f"[bold]{author}:[/bold] {disp}")
+
+                modal.set_status(f"Migrating [cyan]#{source_channel.name}[/cyan] → [green]#{target_channel.get('name')}[/green] ({i + 1}/{len(d_channels)})")
+                result = await migrate_mod.migrate_messages(
+                    self.engine,
+                    source_channel_id=source_channel.id,
+                    target_channel_id=target_channel.get("id"),
+                    after_message_id=after_id,
+                    progress_callback=update_indiv,
+                )
+                modal.write(f"[green]Done: {result['messages']} messages migrated.[/green]")
+                completed += 1
+
+                await log_audit_event(
+                    self.engine,
+                    "Bulk Message Migration",
+                    f"Migrated Discord #{source_channel.name} → {platform_name} #{target_channel.get('name')}: {result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads"
+                )
+            except Exception as e:
+                failed += 1
+                logger.error(f"Bulk migration failed for #{source_channel.name}: {e}")
+                modal.write(f"[bold red]Failed #{source_channel.name}: {e}[/bold red]")
+
+        self.engine.is_running = False
+        modal.set_progress(0, 100)
+        modal.set_item_status("")
+        modal.write(f"\n[bold]Summary:[/bold] [green]{completed} migrated[/green], [yellow]{skipped} skipped[/yellow], [red]{failed} failed[/red].")
+        modal.phase_report("Bulk Channel Migration", "stopped" if interrupted else "complete", show_back=False)
+
+    def _collect_migrated_channel_ids(self, channels: list) -> set:
+        """Source channel IDs that already have migration progress on their mapped target."""
+        migrated = set()
+        if not self.engine or not self.engine.state:
+            return migrated
+        for c in channels:
+            cid = c.get("id") if isinstance(c, dict) else c.id
+            tgt_id = self.engine.state.get_target_channel_id(str(cid))
+            if tgt_id and self.engine.state.get_last_message_id(str(tgt_id)):
+                migrated.add(str(cid))
+        return migrated
+
+    def _get_next_text_channel(self, channels: list, current: Any) -> Any | None:
+        try:
+            idx = next(i for i, c in enumerate(channels) if c.id == current.id)
+        except StopIteration:
+            return None
+        return channels[idx + 1] if idx + 1 < len(channels) else None
+
     async def _logic_migrate_messages(self, modal: ProgressScreen | None = None, is_autotest: bool = False) -> None:
         if not self.tokens_valid:
             return
@@ -1221,6 +1346,11 @@ class OperationPane(Container):
             d_cats = await self.engine.discord_reader.get_categories()
             d_cat_map = {c.id: c.name for c in d_cats}
 
+            # Reorder to match the picker display (uncategorized first, then
+            # categories alphabetically) so Migrate All / Next Channel follow
+            # the exact order shown to the user
+            d_channels = order_channels_for_display(d_channels, d_cat_map)
+
             if not d_channels:
                 modal.write("[yellow]No text channels found.[/yellow]")
                 modal.allow_close()
@@ -1242,44 +1372,61 @@ class OperationPane(Container):
 
             target_cat_names = {str(c.get("id")): c.get("name") for c in full_f if c.get("type") == 4}
 
+            preselected_pair = None
+            preselect_src_id = None
+
             while True:
-                loop = asyncio.get_running_loop()
-                pick_future = loop.create_future()
-
-                def on_pick(result):
-                    if not pick_future.done():
-                        pick_future.set_result(result)
-
-                self.app.push_screen(ChannelPickerScreen(d_channels, d_cat_map, f_channels, target_cat_names, platform_name, all_tgt_channels=full_f), on_pick)
-                res = await pick_future
-
-                if res is None:
-                    await self.engine.close_connections()
-                    return
-                
-                # Handle result from channel picker
-                # Normal: (src_id, tgt_id) - 2-tuple
-                # Create new: (src_id, "create_new", channel_name) - 3-tuple
-                # Enter ID: (src_id, tgt_id, channel_dict) - 3-tuple
-                
                 pending_create_name = None  # Deferred channel creation
-                
-                if len(res) == 3 and res[1] == "create_new":
-                    src_id, _, chan_name = res
-                    source_channel = next(c for c in d_channels if c.id == src_id)
-                    # Don't create yet — defer until user confirms migration
-                    pending_create_name = chan_name
-                    target_channel = {"id": "__pending__", "name": chan_name, "type": 0}
-                
-                elif len(res) == 3:
-                    src_id, _, chan_dict = res
-                    source_channel = next(c for c in d_channels if c.id == src_id)
-                    target_channel = chan_dict
-                
+
+                if preselected_pair is not None:
+                    source_channel, target_channel = preselected_pair
+                    preselected_pair = None
                 else:
-                    src_id, tgt_id = res
-                    source_channel = next(c for c in d_channels if c.id == src_id)
-                    target_channel = next(c for c in f_channels if c.get("id") == tgt_id)
+                    loop = asyncio.get_running_loop()
+                    pick_future = loop.create_future()
+
+                    def on_pick(result):
+                        if not pick_future.done():
+                            pick_future.set_result(result)
+
+                    migrated_ids = self._collect_migrated_channel_ids(d_channels)
+                    self.app.push_screen(ChannelPickerScreen(d_channels, d_cat_map, f_channels, target_cat_names, platform_name, all_tgt_channels=full_f, preselect_src_id=preselect_src_id, migrated_ids=migrated_ids), on_pick)
+                    preselect_src_id = None
+                    res = await pick_future
+
+                    if res is None:
+                        await self.engine.close_connections()
+                        return
+
+                    # Bulk mode: migrate every text channel one by one
+                    if res == "migrate_all":
+                        modal = ProgressScreen(log_level=self.config.log_level)
+                        self.app.push_screen(modal)
+                        await asyncio.sleep(0.1)
+                        await self._logic_migrate_all_channels(modal, d_channels, f_channels, platform_name, migrate_mod)
+                        return
+
+                    # Handle result from channel picker
+                    # Normal: (src_id, tgt_id) - 2-tuple
+                    # Create new: (src_id, "create_new", channel_name) - 3-tuple
+                    # Enter ID: (src_id, tgt_id, channel_dict) - 3-tuple
+
+                    if len(res) == 3 and res[1] == "create_new":
+                        src_id, _, chan_name = res
+                        source_channel = next(c for c in d_channels if c.id == src_id)
+                        # Don't create yet — defer until user confirms migration
+                        pending_create_name = chan_name
+                        target_channel = {"id": "__pending__", "name": chan_name, "type": 0}
+
+                    elif len(res) == 3:
+                        src_id, _, chan_dict = res
+                        source_channel = next(c for c in d_channels if c.id == src_id)
+                        target_channel = chan_dict
+
+                    else:
+                        src_id, tgt_id = res
+                        source_channel = next(c for c in d_channels if c.id == src_id)
+                        target_channel = next(c for c in f_channels if c.get("id") == tgt_id)
 
                 # 2. Analyze
                 modal = ProgressScreen(log_level=self.config.log_level)
@@ -1498,88 +1645,110 @@ class OperationPane(Container):
                     except Exception as e:
                         logger.warning(f"Failed to re-analyze for correct totals: {e}")
 
-                # If we are here, we are proceeding with migration
-                break
+                # Create the channel now if it was deferred
+                if pending_create_name:
+                    modal.set_status(f"Creating channel [green]#{pending_create_name}[/green]...")
+                    try:
+                        new_id = await self.engine.writer.create_channel(name=pending_create_name)
+                        logger.info(f"Created new channel '{pending_create_name}' with ID: {new_id}")
+                        target_channel = {"id": new_id, "name": pending_create_name, "type": 0}
+                        f_channels.append(target_channel)
+                    except Exception as e:
+                        logger.error(f"Failed to create channel '{pending_create_name}': {e}")
+                        modal.write(f"[bold red]Failed to create channel: {e}[/bold red]")
+                        modal.phase_report("Channel Creation", status="error")
+                        return
 
-            # Create the channel now if it was deferred
-            if pending_create_name:
-                modal.set_status(f"Creating channel [green]#{pending_create_name}[/green]...")
-                try:
-                    new_id = await self.engine.writer.create_channel(name=pending_create_name)
-                    logger.info(f"Created new channel '{pending_create_name}' with ID: {new_id}")
-                    target_channel = {"id": new_id, "name": pending_create_name, "type": 0}
-                    f_channels.append(target_channel)
-                except Exception as e:
-                    logger.error(f"Failed to create channel '{pending_create_name}': {e}")
-                    modal.write(f"[bold red]Failed to create channel: {e}[/bold red]")
-                    modal.phase_report("Channel Creation", status="error")
+                # Phase 3: Progress
+                modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
+                modal.phase_progress()
+                modal.set_status("Migrating messages...")
+
+                total_messages = stats_analysis["messages"]
+                total_threads = stats_analysis["threads"]
+                total_attachments = stats_analysis["attachments"]
+
+                modal.set_status(f"Migrating: [cyan]#{source_channel.name}[/cyan] → [green]#{target_channel.get('name')}[/green]")
+                modal.write(f"[bold cyan]Migration Started:[/bold cyan] Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]")
+                modal.write(f"[dim]Stats: {total_messages} messages, {total_threads} threads, {total_attachments} files[/dim]\n")
+
+                logger.info(f"Execution started for #{source_channel.name} -> {platform_name} @ {target_channel.get('name')}")
+                self.engine.is_running = True
+
+                async def update_msg(current_stats):
+                    c_msgs = current_stats["messages"]
+                    c_threads = current_stats["threads"]
+                    c_files = current_stats["attachments"]
+
+                    msg_stat = f"{c_msgs}/{total_messages}" if total_messages > 0 else str(c_msgs)
+                    thr_stat = f"{c_threads}/{total_threads}" if total_threads > 0 else str(c_threads)
+                    fil_stat = f"{c_files}/{total_attachments}" if total_attachments > 0 else str(c_files)
+
+                    modal.set_item_status(f"[cyan]Migrated {msg_stat} messages...")
+                    modal.set_progress(c_msgs, total_messages or 100) # Fallback total for bar animation
+
+                    modal.update_stats(
+                        messages=msg_stat,
+                        threads=thr_stat,
+                        files=fil_stat
+                    )
+
+                    # optionally show a scrolling trace if the backend provided it
+                    modal.write_live(f"Migrated message #{c_msgs}")
+
+                    content = current_stats.get("last_message_content", "")
+                    author = current_stats.get("last_message_author", "Unknown")
+                    if content:
+                        # Clean up content for display (truncate long messages)
+                        disp_content = (content[:100] + '...') if len(content) > 100 else content
+                        modal.write(f"[bold]{author}:[/bold] {disp_content}")
+
+                result = await migrate_mod.migrate_messages(
+                    self.engine,
+                    source_channel_id=source_channel.id,
+                    target_channel_id=target_channel.get("id"),
+                    after_message_id=after_id,
+                    inclusive=is_inclusive,
+                    progress_callback=update_msg,
+                )
+
+                next_channel = None
+                if self.engine.is_running:
+                    modal.write(f"[bold green]Success! {result['messages']} messages migrated.[/bold green]")
+                    event_title = "Message Migration"
+                    next_channel = self._get_next_text_channel(d_channels, source_channel)
+                    modal.phase_report(event_title, show_back=False, next_channel_name=next_channel.name if next_channel else None)
+                else:
+                    modal.write(f"[bold yellow]Interrupted! {result['messages']} messages migrated.[/bold yellow]")
+                    event_title = "Message Migration"
+                    modal.phase_report(event_title, "stopped", show_back=False)
+
+                lines = [f"Migrated Discord #{source_channel.name} → {platform_name} #{target_channel.get('name')}:"]
+                lines.append(f"{result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads")
+                await log_audit_event(self.engine, event_title, "\n".join(lines))
+
+                if not self.engine.is_running or next_channel is None:
                     return
 
-            # Phase 3: Progress
-            modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
-            modal.phase_progress()
-            modal.set_status("Migrating messages...")
+                loop = asyncio.get_running_loop()
+                modal.confirm_future = loop.create_future()
+                report_choice = await modal.confirm_future
 
-            total_messages = stats_analysis["messages"]
-            total_threads = stats_analysis["threads"]
-            total_attachments = stats_analysis["attachments"]
-            
-            modal.set_status(f"Migrating: [cyan]#{source_channel.name}[/cyan] → [green]#{target_channel.get('name')}[/green]")
-            modal.write(f"[bold cyan]Migration Started:[/bold cyan] Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]")
-            modal.write(f"[dim]Stats: {total_messages} messages, {total_threads} threads, {total_attachments} files[/dim]\n")
-            
-            logger.info(f"Execution started for #{source_channel.name} -> {platform_name} @ {target_channel.get('name')}")
-            self.engine.is_running = True
-
-            async def update_msg(current_stats):
-                c_msgs = current_stats["messages"]
-                c_threads = current_stats["threads"]
-                c_files = current_stats["attachments"]
-                
-                msg_stat = f"{c_msgs}/{total_messages}" if total_messages > 0 else str(c_msgs)
-                thr_stat = f"{c_threads}/{total_threads}" if total_threads > 0 else str(c_threads)
-                fil_stat = f"{c_files}/{total_attachments}" if total_attachments > 0 else str(c_files)
-
-                modal.set_item_status(f"[cyan]Migrated {msg_stat} messages...")
-                modal.set_progress(c_msgs, total_messages or 100) # Fallback total for bar animation
-                
-                modal.update_stats(
-                    messages=msg_stat,
-                    threads=thr_stat,
-                    files=fil_stat
-                )
-                
-                # optionally show a scrolling trace if the backend provided it
-                modal.write_live(f"Migrated message #{c_msgs}")
-
-                content = current_stats.get("last_message_content", "")
-                author = current_stats.get("last_message_author", "Unknown")
-                if content:
-                    # Clean up content for display (truncate long messages)
-                    disp_content = (content[:100] + '...') if len(content) > 100 else content
-                    modal.write(f"[bold]{author}:[/bold] {disp_content}")
-
-            result = await migrate_mod.migrate_messages(
-                self.engine,
-                source_channel_id=source_channel.id,
-                target_channel_id=target_channel.get("id"),
-                after_message_id=after_id,
-                inclusive=is_inclusive,
-                progress_callback=update_msg,
-            )
-
-            if self.engine.is_running:
-                modal.write(f"[bold green]Success! {result['messages']} messages migrated.[/bold green]")
-                event_title = "Message Migration"
-                modal.phase_report(event_title, show_back=False)
-            else:
-                modal.write(f"[bold yellow]Interrupted! {result['messages']} messages migrated.[/bold yellow]")
-                event_title = "Message Migration"
-                modal.phase_report(event_title, "stopped", show_back=False)
-
-            lines = [f"Migrated Discord #{source_channel.name} → {platform_name} #{target_channel.get('name')}:"]
-            lines.append(f"{result['messages']} messages, {result['attachments']} attachments, {result['threads']} threads")
-            await log_audit_event(self.engine, event_title, "\n".join(lines))
+                if report_choice == "btn_next_channel":
+                    modal.dismiss()
+                    tgt_id = self.engine.state.get_target_channel_id(str(next_channel.id))
+                    matched_target = next((c for c in f_channels if str(c.get("id")) == str(tgt_id)), None) if tgt_id else None
+                    if matched_target:
+                        preselected_pair = (next_channel, matched_target)
+                    else:
+                        preselect_src_id = next_channel.id
+                    continue
+                elif report_choice == "btn_back":
+                    modal.dismiss()
+                    continue
+                else:
+                    modal.dismiss()
+                    return
 
         except Exception as e:
             err = str(e)

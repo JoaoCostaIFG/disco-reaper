@@ -71,6 +71,65 @@ async def test_migration_transform_stoat(mock_context, mock_message):
 # --- Integration Tests (Backup Reader) ---
 
 @pytest.mark.asyncio
+async def test_migrate_all_channels_continues_previous():
+    """Bulk migrate-all must act as 'Continue Migration' for channels with prior
+    progress and 'Start from First' for fresh channels."""
+    from types import SimpleNamespace
+    from src.ui.shuttle_ops import OperationPane
+
+    pane = OperationPane.__new__(OperationPane)
+    pane.target_platform = "fluxer"
+
+    engine = MagicMock()
+    engine.config.fluxer_server_id = "guild-1"
+    engine.writer.validate = AsyncMock(return_value={"community_name": "Target"})
+    engine.ensure_state_initialized = MagicMock()
+    engine.is_running = True
+    engine.state.get_target_channel_id.side_effect = lambda src_id: {"1": "t1", "2": "t2"}.get(src_id)
+    engine.state.get_last_message_id.side_effect = lambda tgt_id: {"t1": "500"}.get(tgt_id)
+    engine.state.clear_channel_data = MagicMock()
+    pane.engine = engine
+
+    migrate_mod = MagicMock()
+    migrate_mod.analyze_migration = AsyncMock(return_value={"messages": 3, "threads": 0, "attachments": 0})
+    migrate_mod.migrate_messages = AsyncMock(return_value={"messages": 3, "attachments": 0, "threads": 0})
+
+    modal = MagicMock()
+    d_channels = [SimpleNamespace(id=1, name="general"), SimpleNamespace(id=2, name="random")]
+    f_channels = [{"id": "t1", "name": "general"}, {"id": "t2", "name": "random"}]
+
+    with patch("src.ui.shuttle_ops.log_audit_event", AsyncMock()):
+        await pane._logic_migrate_all_channels(modal, d_channels, f_channels, "Fluxer", migrate_mod)
+
+    # Channel 1 was already migrated: resume after last message (500)
+    assert migrate_mod.analyze_migration.call_args_list[0].kwargs["after_message_id"] == 500
+    assert migrate_mod.migrate_messages.call_args_list[0].kwargs["after_message_id"] == 500
+    # Channel 2 is fresh: start from the first message
+    assert migrate_mod.analyze_migration.call_args_list[1].kwargs["after_message_id"] is None
+    assert migrate_mod.migrate_messages.call_args_list[1].kwargs["after_message_id"] is None
+    # Clean-sink clear only happens for the fresh channel
+    engine.state.clear_channel_data.assert_called_once_with("t2")
+
+    writes = [c.args[0] for c in modal.write.call_args_list if c.args]
+    assert any("Continue Migration after message 500" in w for w in writes)
+
+@pytest.mark.asyncio
+async def test_collect_migrated_channel_ids():
+    """A channel counts as migrated only with a mapping AND prior message progress."""
+    from types import SimpleNamespace
+    from src.ui.shuttle_ops import OperationPane
+
+    pane = OperationPane.__new__(OperationPane)
+    engine = MagicMock()
+    engine.state.get_target_channel_id.side_effect = lambda src_id: {"1": "t1", "2": "t2"}.get(src_id)
+    engine.state.get_last_message_id.side_effect = lambda tgt_id: {"t1": "500"}.get(tgt_id)
+    pane.engine = engine
+
+    channels = [SimpleNamespace(id=1, name="a"), SimpleNamespace(id=2, name="b"), SimpleNamespace(id=3, name="c")]
+    # 1: mapped + migrated; 2: mapped but no messages yet; 3: not mapped
+    assert pane._collect_migrated_channel_ids(channels) == {"1"}
+
+@pytest.mark.asyncio
 async def test_backup_reader_interaction(backup_reader, reaper_config):
     await backup_reader.start()
     assert backup_reader.guild is not None
