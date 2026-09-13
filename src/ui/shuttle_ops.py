@@ -1441,6 +1441,10 @@ class OperationPane(Container):
                     last_migrated = self.engine.state.get_last_message_id(str(target_channel.get('id')))
                     has_previous = bool(last_migrated)
 
+                # Remigrate (purge target channel + restart from first) only makes
+                # sense with prior messages to delete and a writer that supports it
+                can_remigrate = has_previous and hasattr(self.engine.writer, "delete_channel_messages")
+
                 src_server = getattr(self.engine.discord_reader, 'guild', None)
                 tgt_server_info = await self.engine.writer.validate()
                 tgt_server_name = tgt_server_info.get("community_name", "target community")
@@ -1467,7 +1471,8 @@ class OperationPane(Container):
                     btn_id_label="Start from\nmessage ID",
                     btn_start_tooltip="Start migrating from the earliest available message",
                     btn_continue_tooltip="Resume from the last successfully migrated message",
-                    btn_id_tooltip="Start migrating from a specific Discord message ID"
+                    btn_id_tooltip="Start migrating from a specific Discord message ID",
+                    show_remigrate=can_remigrate
                 )
 
                 self.engine.is_running = True
@@ -1528,7 +1533,8 @@ class OperationPane(Container):
                     btn_id_label="Start from\nmessage ID",
                     btn_start_tooltip="Start migrating from the earliest available message",
                     btn_continue_tooltip="Resume from the last successfully migrated message",
-                    btn_id_tooltip="Start migrating from a specific Discord message ID"
+                    btn_id_tooltip="Start migrating from a specific Discord message ID",
+                    show_remigrate=can_remigrate
                 ))
 
                 # Wait for either analysis to finish OR user to make a choice
@@ -1580,6 +1586,29 @@ class OperationPane(Container):
                 if choice == "btn_continue" and last_migrated:
                     logger.info("Proceeding with 'Continue Migration' (incremental sink).")
                     after_id = int(last_migrated)
+                elif choice == "btn_remigrate":
+                    logger.info("Proceeding with 'Remigrate' (purge target channel, restart from first).")
+                    modal.phase_progress()
+                    modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
+                    self.engine.is_running = True
+                    modal.set_status(f"Deleting all messages in {platform_name} [green]#{target_channel.get('name')}[/green]...")
+
+                    async def update_purge(deleted: int, total: int):
+                        modal.set_item_status(f"[cyan]Deleted {deleted}/{total} messages...[/cyan]")
+
+                    deleted_count = await self.engine.writer.delete_channel_messages(
+                        str(target_channel.get("id")),
+                        progress_callback=update_purge,
+                        cancel_check=lambda: not self.engine.is_running,
+                    )
+                    modal.write(f"[bold red]Deleted {deleted_count} messages from {platform_name} #{target_channel.get('name')}.[/bold red]")
+
+                    if not self.engine.is_running:
+                        modal.write("[yellow]Remigrate cancelled during message deletion. Target channel left partially cleared.[/yellow]")
+                        modal.phase_report("Remigrate", "stopped", show_back=False)
+                        return
+
+                    # Falls through to 'Start from First' below: state cleared, after_id = None
                 elif choice == "btn_start_id":
                     loop = asyncio.get_running_loop()
                     future = loop.create_future()
@@ -1615,6 +1644,8 @@ class OperationPane(Container):
                     modal.phase_progress() # Hide buttons immediately
                     if choice == "btn_start_first":
                         modal.set_status("Starting from first message...")
+                    elif choice == "btn_remigrate":
+                        modal.set_status("Restarting migration from first message...")
                     elif choice == "btn_start_id":
                         modal.set_status(f"Starting from ID [cyan]{after_id}[/cyan]...")
                     else:

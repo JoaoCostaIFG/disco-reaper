@@ -655,6 +655,59 @@ class FluxerWriter:
                 logger.error(f"Failed to delete channel {ch.get('name')}: {e}")
         return deleted
 
+    async def delete_channel_messages(self, channel_id: str, progress_callback=None, cancel_check=None) -> int:
+        """
+        Deletes all messages in a Fluxer channel (used by 'Remigrate Channel').
+        Returns the number of messages deleted.
+        """
+        assert self.client is not None
+
+        # 1. Collect all message IDs, paging backwards through history
+        all_ids: List[int] = []
+        cursor = None
+        try:
+            while True:
+                if cancel_check and cancel_check():
+                    logger.info(f"Fluxer: Message deletion cancelled for channel {channel_id}")
+                    break
+                batch = await self.client.get_messages(channel_id, limit=100, before=cursor)
+                if not batch:
+                    break
+                ids = [int(m["id"]) for m in batch if m.get("id") is not None]
+                if not ids:
+                    break
+                all_ids.extend(ids)
+                cursor = min(ids)
+        except Exception as e:
+            print(f"Failed to list messages in channel {channel_id}: {e}")
+            logger.error(f"Failed to list messages in channel {channel_id}: {e}")
+
+        total = len(all_ids)
+        if not total:
+            return 0
+
+        # 2. Bulk-delete in chunks, falling back to per-message deletes
+        deleted = 0
+        for i in range(0, total, 100):
+            if cancel_check and cancel_check():
+                logger.info(f"Fluxer: Message deletion cancelled for channel {channel_id} ({deleted}/{total} deleted)")
+                break
+            chunk = all_ids[i:i + 100]
+            try:
+                await self.client.delete_messages(channel_id, chunk)
+                deleted += len(chunk)
+            except Exception:
+                for mid in chunk:
+                    try:
+                        await self.client.delete_message(channel_id, mid)
+                        deleted += 1
+                    except Exception as e:
+                        logger.error(f"Failed to delete message {mid} in channel {channel_id}: {e}")
+            if progress_callback:
+                await progress_callback(deleted, total)
+
+        return deleted
+
     async def reset_channel_permissions(self, progress_callback=None) -> int:
         """
         Resets all permission overwrites on every channel and category.

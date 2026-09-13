@@ -76,6 +76,7 @@ class ProgressScreen(Screen[None]):
     .action_row Button { width: 1fr; margin: 0 1; }
     #prog_actions_row1, #prog_actions_row2 { display: none; }
     #btn_next_channel { display: none; }
+    #btn_remigrate { display: none; }
     #footer_rule { margin: 0; }
     """
 
@@ -109,6 +110,7 @@ class ProgressScreen(Screen[None]):
                         yield Button("Start from First", id="btn_start_first", disabled=True, variant="primary", tooltip="Start the operation from the beginning")
                         yield Button("Continue Migration", id="btn_continue", disabled=True, variant="success", tooltip="Resume the operation from the last saved state")
                         yield Button("Start from ID", id="btn_start_id", disabled=True, variant="warning", tooltip="Start or resume from a specific Discord Message ID")
+                        yield Button("Remigrate Channel", id="btn_remigrate", disabled=True, variant="error", tooltip="Delete all messages in the target channel,\nthen restart migration from the first message")
                     with Horizontal(classes="action_row", id="prog_actions_row2"):
                         yield Button("Next Channel", id="btn_next_channel", variant="primary")
                         yield Button("Back", id="btn_back", disabled=False)
@@ -250,7 +252,8 @@ class ProgressScreen(Screen[None]):
         btn_start_variant: str = "primary",
         btn_start_tooltip: str | None = None,
         btn_continue_tooltip: str | None = None,
-        btn_id_tooltip: str | None = None
+        btn_id_tooltip: str | None = None,
+        show_remigrate: bool = False
     ):
         """Phase 2: Wait for user confirmation after analysis."""
         # Hide loading state if it was still running
@@ -270,7 +273,8 @@ class ProgressScreen(Screen[None]):
             btn_start_variant=btn_start_variant,
             btn_start_tooltip=btn_start_tooltip,
             btn_continue_tooltip=btn_continue_tooltip,
-            btn_id_tooltip=btn_id_tooltip
+            btn_id_tooltip=btn_id_tooltip,
+            show_remigrate=show_remigrate
         )
             
         loop = asyncio.get_running_loop()
@@ -291,7 +295,8 @@ class ProgressScreen(Screen[None]):
         btn_start_variant: str = "primary",
         btn_start_tooltip: str | None = None,
         btn_continue_tooltip: str | None = None,
-        btn_id_tooltip: str | None = None
+        btn_id_tooltip: str | None = None,
+        show_remigrate: bool = False
     ):
         """Show the operation buttons early (e.g. during analysis) so user can skip wait."""
         # Update button labels, variants and tooltips
@@ -320,6 +325,12 @@ class ProgressScreen(Screen[None]):
             btn_id.display = show_id
             if btn_id_tooltip:
                 btn_id.tooltip = btn_id_tooltip
+        except Exception: pass
+
+        try:
+            btn_rem = self.query_one("#btn_remigrate", Button)
+            btn_rem.disabled = not show_remigrate
+            btn_rem.display = show_remigrate
         except Exception: pass
 
         # Show confirmation button rows
