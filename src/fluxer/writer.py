@@ -6,6 +6,11 @@ from fluxer import Bot, Webhook, Forbidden, File, NotFound, Unauthorized
 
 logger = logging.getLogger(__name__)
 
+# How long to wait for Fluxer's server-side deletion queue to drain after
+# purging a channel, and how often to re-check, before re-migration resumes
+_SETTLE_POLL_DELAY = 2.0
+_SETTLE_MAX_WAIT = 60.0
+
 class FluxerWriter:
     def __init__(self, token: str, community_id: str, api_url: str = "default"):
         self.token = token
@@ -657,7 +662,8 @@ class FluxerWriter:
 
     async def delete_channel_messages(self, channel_id: str, progress_callback=None, cancel_check=None) -> int:
         """
-        Deletes all messages in a Fluxer channel (used by 'Remigrate Channel').
+        Deletes all messages in a Fluxer channel (used by 'Remigrate Channel'),
+        then waits until the channel actually reads empty.
         Returns the number of messages deleted.
         """
         assert self.client is not None
@@ -705,6 +711,50 @@ class FluxerWriter:
                         logger.error(f"Failed to delete message {mid} in channel {channel_id}: {e}")
             if progress_callback:
                 await progress_callback(deleted, total)
+
+        # 3. Wait for the server to settle before returning. Fluxer processes
+        # deletions asynchronously, so reads can still show messages after the
+        # delete calls return. Re-migrating at that point races the pending
+        # deletes: freshly re-sent messages can be taken out by them. Poll
+        # until the channel actually reads empty, re-deleting any stragglers.
+        settled = False
+        cancelled = False
+        waited = 0.0
+        while waited <= _SETTLE_MAX_WAIT:
+            if cancel_check and cancel_check():
+                cancelled = True
+                logger.info(f"Fluxer: Message deletion settle-wait cancelled for channel {channel_id}")
+                break
+
+            try:
+                remaining = await self.client.get_messages(channel_id, limit=100)
+            except Exception as e:
+                logger.warning(f"Fluxer: Failed to verify channel {channel_id} is empty: {e}")
+                await asyncio.sleep(_SETTLE_POLL_DELAY)
+                waited += _SETTLE_POLL_DELAY
+                continue
+
+            if not remaining:
+                settled = True
+                break
+
+            logger.debug(f"Fluxer: {len(remaining)} message(s) still visible in channel {channel_id}; waiting for server to settle...")
+            # Re-delete stragglers. Already-deleted messages (read lag) will error and be ignored.
+            for m in remaining:
+                try:
+                    await self.client.delete_message(channel_id, m["id"])
+                    deleted += 1
+                except Exception:
+                    pass
+
+            await asyncio.sleep(_SETTLE_POLL_DELAY)
+            waited += _SETTLE_POLL_DELAY
+
+        if not cancelled and not settled:
+            logger.warning(
+                f"Fluxer: Channel {channel_id} did not settle within {_SETTLE_MAX_WAIT}s; "
+                "pending server-side deletions may remove re-sent messages"
+            )
 
         return deleted
 
