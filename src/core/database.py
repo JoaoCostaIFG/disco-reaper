@@ -252,6 +252,17 @@ class MigrationDatabase:
             return {str(row["source_msg_id"]): str(row["target_msg_id"]) for row in rows}
         return {row["source_msg_id"]: row["target_msg_id"] for row in rows}
 
+    def get_all_thread_message_mappings(self, channel_id: str) -> Dict[Union[str, int], Union[str, int]]:
+        """All source→target message mappings recorded for threads in this target channel (any thread)."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT source_msg_id, target_msg_id FROM thread_mappings WHERE channel_id = ?",
+            (str(channel_id),)
+        ).fetchall()
+        if self.platform == "stoat":
+            return {str(row["source_msg_id"]): str(row["target_msg_id"]) for row in rows}
+        return {row["source_msg_id"]: row["target_msg_id"] for row in rows}
+
     # --- User Alias Methods ---
 
     def _generate_alias(self) -> str:

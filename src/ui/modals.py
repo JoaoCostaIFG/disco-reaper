@@ -376,7 +376,7 @@ class ProgressScreen(Screen[None]):
         try: self.query_one("#info_new_items", Label).display = False
         except Exception: pass
 
-    def phase_report(self, operation_name: str, status: str = "complete", show_back: bool = True, next_channel_name: str | None = None):
+    def phase_report(self, operation_name: str, status: str = "complete", show_back: bool = True, next_channel_name: str | None = None, next_button_label: str | None = None):
         """Phase 4: Operation is done. Show Back + Main Menu.
         
         status can be: 'complete', 'stopped', 'error'
@@ -429,7 +429,7 @@ class ProgressScreen(Screen[None]):
         try:
             next_btn = self.query_one("#btn_next_channel", Button)
             if next_channel_name:
-                next_btn.label = f"Migrate #{next_channel_name}"
+                next_btn.label = next_button_label or f"Migrate #{next_channel_name}"
                 next_btn.tooltip = "Migrate the next text channel from the list"
                 next_btn.display = True
                 next_btn.disabled = False
@@ -653,7 +653,7 @@ class ChannelPickerScreen(Screen[tuple | str]):
     #chanpick_buttons Button { width: 1fr; margin: 0 1; }
     """
 
-    def __init__(self, src_channels: list, src_cat_map: dict, tgt_channels: list, tgt_cat_map: dict, tgt_name: str = "Fluxer", all_tgt_channels: list | None = None, preselect_src_id: int | str | None = None, migrated_ids: set | None = None):
+    def __init__(self, src_channels: list, src_cat_map: dict, tgt_channels: list, tgt_cat_map: dict, tgt_name: str = "Fluxer", all_tgt_channels: list | None = None, preselect_src_id: int | str | None = None, migrated_ids: set | None = None, bulk_label: str = "Migrate All Channels", bulk_tooltip: str | None = None, bulk_value: str = "migrate_all", show_extras: bool = True):
         super().__init__()
         self.src_channels = src_channels
         self.src_cat_map = src_cat_map
@@ -663,6 +663,10 @@ class ChannelPickerScreen(Screen[tuple | str]):
         self.all_tgt_channels = all_tgt_channels or tgt_channels
         self.preselect_src_id = preselect_src_id
         self.migrated_ids = {str(x) for x in (migrated_ids or [])}
+        self.bulk_label = bulk_label
+        self.bulk_tooltip = bulk_tooltip or "Automatically migrate every text channel, one by one\n(targets matched by existing mapping or channel name;\nalready-migrated channels resume from last message)"
+        self.bulk_value = bulk_value
+        self.show_extras = show_extras
 
     def _render_pane(self, channels, categories, pane_id, prefix):
         options = []
@@ -683,7 +687,7 @@ class ChannelPickerScreen(Screen[tuple | str]):
                 options.append(Option(name, id=f"{prefix}_{cid}"))
         
         # Add "Extras" category to the target pane only
-        if prefix == "tgt":
+        if prefix == "tgt" and self.show_extras:
             options.append(Option(f"[bold yellow]── Extras ──[/bold yellow]", id="header_extras", disabled=True))
             options.append(Option("✨ Create New channel+", id="tgt_create_new"))
             options.append(Option("🔗 Enter Channel ID", id="tgt_enter_id"))
@@ -707,7 +711,7 @@ class ChannelPickerScreen(Screen[tuple | str]):
                 yield Rule(id="footer_rule")
                 with Horizontal(id="chanpick_buttons"):
                     yield Button("Select", variant="success", id="btn_pick_ok", tooltip="Confirm selection and start migration")
-                    yield Button("Migrate All Channels", variant="warning", id="btn_pick_all", tooltip="Automatically migrate every text channel, one by one\n(targets matched by existing mapping or channel name;\nalready-migrated channels resume from last message)")
+                    yield Button(self.bulk_label, variant="warning", id="btn_pick_all", tooltip=self.bulk_tooltip)
                     yield Button("Back", id="btn_pick_back", tooltip="Cancel selection")
         yield Footer()
         yield RamDisplay()
@@ -765,7 +769,7 @@ class ChannelPickerScreen(Screen[tuple | str]):
         if event.button.id == "btn_pick_back":
             self.dismiss(None)
         elif event.button.id == "btn_pick_all":
-            self.dismiss("migrate_all")
+            self.dismiss(self.bulk_value)
         elif event.button.id == "btn_pick_ok":
             src_list = self.query_one("#src_list", OptionList)
             tgt_list = self.query_one("#tgt_list", OptionList)

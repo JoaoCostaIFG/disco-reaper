@@ -182,6 +182,18 @@ class MigrationState:
     def get_fluxer_message_id(self, target_channel_id: str, discord_id: str) -> str | int | None:
         return self.get_target_message_id(target_channel_id, discord_id)
 
+    def get_all_message_mappings(self, target_channel_id: str) -> Dict[int | str, str | int]:
+        """All source→target message mappings recorded for a target channel (main messages)."""
+        if self._ensure_db():
+            return self.db.get_all_message_mappings(str(target_channel_id))
+        return {}
+
+    def get_all_thread_message_mappings(self, target_channel_id: str) -> Dict[int | str, str | int]:
+        """All source→target message mappings recorded for threads in a target channel (any thread)."""
+        if self._ensure_db():
+            return self.db.get_all_thread_message_mappings(str(target_channel_id))
+        return {}
+
     def increment_stats(self, target_channel_id: str, messages: int = 1, files: int = 0):
         if self._ensure_db():
             self.db.update_channel_tracking(str(target_channel_id), msg_inc=messages, file_inc=files)

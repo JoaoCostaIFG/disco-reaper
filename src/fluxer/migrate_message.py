@@ -937,3 +937,293 @@ async def migrate_global_messages(
         pass
         
     return stats
+
+
+# ── Migration Verification ─────────────────────────────────────────────
+
+# Prefix lines the Fluxer writer adds before the actual message body
+_FLUXER_TS_PREFIX_RE = re.compile(r"^-# <t:(\d+):D>$")
+_FLUXER_FORWARDED_PREFIX_RE = re.compile(r"^-# ⮫\*forwarded\*$")
+_FLUXER_AUTHOR_PREFIX_RE = re.compile(r"^-# · .+$")
+_THREAD_MARKER_RE = re.compile(r"^> <<< THREAD: \*\*.+\*\* >>>$")
+_REPLY_TAG_RE = re.compile(r"^`@.+`$")
+END_OF_THREAD_MARKER = "> <<< END OF THREAD >>>"
+
+# Cap on the number of detailed issues returned in the result (counts stay exact)
+_MAX_ISSUE_DETAILS = 200
+
+# Message types eligible for migration (mirrors the migrate/analyze filters)
+def _migratable_types(context: MigrationContext) -> list:
+    return [
+        context.discord_reader.MESSAGE_TYPE_DEFAULT,
+        context.discord_reader.MESSAGE_TYPE_REPLY,
+        context.discord_reader.MESSAGE_TYPE_THREAD_STARTER,
+        context.discord_reader.MESSAGE_TYPE_FORWARD,
+        context.discord_reader.MESSAGE_TYPE_CHAT_INPUT_COMMAND,
+        context.discord_reader.MESSAGE_TYPE_CONTEXT_MENU_COMMAND,
+        context.discord_reader.MESSAGE_TYPE_POLL_RESULT,
+        context.discord_reader.MESSAGE_TYPE_AUTO_MODERATION_ACTION
+    ]
+
+
+def _extract_target_body(content: str) -> tuple[str, int | None]:
+    """
+    Strips the '-#' subtext prefix lines added by the Fluxer writer
+    (timestamp, forwarded marker, bot author fallback).
+    Returns (body, timestamp_from_prefix or None if the prefix is missing).
+    """
+    lines = (content or "").split("\n")
+    ts_match = _FLUXER_TS_PREFIX_RE.match(lines[0]) if lines else None
+    ts_val = int(ts_match.group(1)) if ts_match else None
+    i = 0
+    while i < len(lines) and (
+        _FLUXER_TS_PREFIX_RE.match(lines[i])
+        or _FLUXER_FORWARDED_PREFIX_RE.match(lines[i])
+        or _FLUXER_AUTHOR_PREFIX_RE.match(lines[i])
+    ):
+        i += 1
+    return "\n".join(lines[i:]), ts_val
+
+
+def _strip_optional_markers(body: str, msg: Any, target_channel_id: str, state: Any) -> str:
+    """
+    Removes prefixes the migration adds conditionally (checked line by line):
+    - the thread-start marker on the first message of a thread
+    - the `@Author` fallback tag on replies whose target was unmapped at send time
+    """
+    first, _, rest = body.partition("\n")
+    if _THREAD_MARKER_RE.match(first):
+        body = rest
+        first, _, rest = body.partition("\n")
+    if (
+        getattr(msg, "reference", None) is not None
+        and getattr(msg.reference, "message_id", None)
+        and not state.get_target_message_id(target_channel_id, str(msg.reference.message_id))
+    ):
+        if _REPLY_TAG_RE.match(first):
+            body = rest
+    return body
+
+
+async def _fetch_all_target_messages(context: MigrationContext, target_channel_id: str) -> Dict[str, Dict[str, Any]]:
+    """Pages backwards through the Fluxer channel and returns {message_id: raw message dict}."""
+    messages: Dict[str, Dict[str, Any]] = {}
+    cursor = None
+    try:
+        while True:
+            if not context.is_running:
+                break
+            batch = await context.fluxer_writer.client.get_messages(str(target_channel_id), limit=100, before=cursor)
+            if not batch:
+                break
+            ids = [int(m["id"]) for m in batch if m.get("id") is not None]
+            if not ids:
+                break
+            for m in batch:
+                if m.get("id") is not None:
+                    messages[str(m["id"])] = m
+            cursor = min(ids)
+    except Exception as e:
+        logger.error(f"Failed to list messages in target channel {target_channel_id}: {e}")
+    return messages
+
+
+def _expected_body_and_files(context: MigrationContext, msg: Any, channel_names: Dict[str, str] | None) -> tuple[str, bool, int]:
+    """
+    Rebuilds what _process_and_send_message would produce for this message:
+    returns (expected_clean_content, is_forwarded, expected_file_count).
+    """
+    content = msg.content or ""
+    is_forwarded = bool(getattr(msg.flags, "forwarded", False)) if hasattr(msg, "flags") else False
+
+    file_count = 0
+    if hasattr(msg, "stickers") and msg.stickers:
+        file_count += len(msg.stickers)
+
+    if is_forwarded and getattr(msg, "message_snapshots", None):
+        snapshot = msg.message_snapshots[0]
+        if not content:
+            content = snapshot.content
+        file_count += len(snapshot.attachments)
+
+    file_count += len(msg.attachments)
+
+    content = clean_mentions(
+        content=content,
+        guild=context.discord_reader.guild,
+        user_mentions=msg.mentions,
+        role_mentions=msg.role_mentions,
+        channel_mentions=msg.channel_mentions,
+        emoji_map=context.state.emoji_map,
+        channel_map=context.state.channel_map,
+        state=context.state,
+        target_server_id=context.fluxer_writer.community_id,
+        channel_names=channel_names,
+        anonymize_users=context.config.anonymize_users if hasattr(context, "config") else False
+    )
+    return content, is_forwarded, file_count
+
+
+async def verify_messages(
+    context: MigrationContext,
+    source_channel_id: int,
+    target_channel_id: str,
+    progress_callback: Callable[[Dict[str, Any]], Awaitable[None]] | None = None
+) -> Dict[str, Any]:
+    """
+    Verifies the migration of a channel by comparing every migratable Discord message
+    (main channel and threads) against its mapped Fluxer counterpart.
+
+    Checks per message: mapping exists, target message still exists, timestamp subtext,
+    content and attachment count. Also flags target messages that no mapping accounts for.
+
+    Returns stats with exact counts and a capped list of issue details.
+    """
+    stats = {
+        "scanned": 0,
+        "checked": 0,
+        "verified": 0,
+        "skipped": 0,
+        "missing_mapping": 0,
+        "missing_on_target": 0,
+        "content_mismatch": 0,
+        "attachment_mismatch": 0,
+        "extra_on_target": 0,
+        "issues": []
+    }
+
+    reader = context.discord_reader
+    allowed_types = _migratable_types(context)
+
+    # Pre-fetch channel and thread names for mention resolution (mirrors migrate_messages)
+    channel_names = getattr(context, "channel_names", None)
+    if channel_names is None:
+        context.channel_names = {}
+        channel_names = context.channel_names
+        try:
+            all_channels = await reader.fetch_channels()
+            for c in all_channels:
+                channel_names[str(c.id)] = c.name
+            threads = await reader.get_active_threads()
+            for t in threads:
+                channel_names[str(t.id)] = t.name
+        except Exception as e:
+            logger.debug(f"Failed to pre-fetch channel names: {e}")
+
+    def _add_issue(kind: str, msg: Any, detail: str):
+        stats[kind] = stats.get(kind, 0) + 1
+        if len(stats["issues"]) < _MAX_ISSUE_DETAILS:
+            stats["issues"].append({
+                "kind": kind,
+                "source_id": str(getattr(msg, "id", "")) or None,
+                "author": msg.author.display_name if getattr(msg, "author", None) else "Unknown",
+                "detail": detail,
+                "content": (getattr(msg, "content", "") or "")[:100]
+            })
+
+    async def _verify_message(msg: Any, thread: Any = None):
+        stats["scanned"] += 1
+
+        if msg.type not in allowed_types:
+            stats["skipped"] += 1
+            return
+
+        expected_content, is_forwarded, file_count = _expected_body_and_files(context, msg, channel_names)
+
+        # Messages with no content and no files are never sent by the migration
+        if not expected_content and file_count == 0:
+            stats["skipped"] += 1
+            return
+
+        stats["checked"] += 1
+
+        # Mapping lookup: thread mapping first for thread messages (individual mode),
+        # then message mappings (waterfall mode records everything there)
+        mapping = None
+        if thread is not None:
+            mapping = context.state.get_thread_message_id(target_channel_id, str(thread.id), str(msg.id))
+        if not mapping:
+            mapping = context.state.get_target_message_id(target_channel_id, str(msg.id))
+
+        if not mapping:
+            _add_issue("missing_mapping", msg, "No migration mapping found (message was never migrated)")
+            return
+
+        mapping = str(mapping)
+        tgt = target_msgs.get(mapping)
+        if tgt is None:
+            _add_issue("missing_on_target", msg, f"Mapped message {mapping} not found on Fluxer (deleted?)")
+            return
+
+        tgt_content = tgt.get("content") or ""
+        body, prefix_ts = _extract_target_body(tgt_content)
+
+        expected_ts = int(msg.created_at.timestamp())
+        if prefix_ts is None or prefix_ts != expected_ts:
+            _add_issue("content_mismatch", msg, f"Timestamp subtext mismatch: expected <t:{expected_ts}:D>, got {tgt_content.splitlines()[0] if tgt_content else '(empty)'}")
+            return
+
+        body = _strip_optional_markers(body, msg, target_channel_id, context.state)
+
+        expected_body = expected_content
+        if is_forwarded and expected_body:
+            expected_body = f">>> {expected_body}"
+
+        if body.strip() != expected_body.strip():
+            _add_issue("content_mismatch", msg, f"Content differs: expected {expected_body[:80]!r}, got {body[:80]!r}")
+            return
+
+        tgt_attachments = tgt.get("attachments") or []
+        if len(tgt_attachments) != file_count:
+            _add_issue("attachment_mismatch", msg, f"Attachments: expected {file_count}, found {len(tgt_attachments)}")
+            return
+
+        stats["verified"] += 1
+
+    # 1. Fetch all target messages once
+    target_msgs = await _fetch_all_target_messages(context, target_channel_id)
+    stats["target_messages"] = len(target_msgs)
+
+    # 2. Verify main channel messages
+    async for msg in reader.fetch_message_history(source_channel_id):
+        if not context.is_running:
+            break
+        await _verify_message(msg)
+        if progress_callback and stats["scanned"] % 25 == 0:
+            await progress_callback(stats)
+
+    # 3. Verify thread messages
+    threads = await get_channel_threads(reader, source_channel_id)
+    for t in threads:
+        if not context.is_running:
+            break
+        async for msg in reader.fetch_message_history(t.id):
+            if not context.is_running:
+                break
+            await _verify_message(msg, thread=t)
+            if progress_callback and stats["scanned"] % 25 == 0:
+                await progress_callback(stats)
+
+    # 4. Flag target messages that no mapping accounts for (excluding thread end markers)
+    mapped_target_ids = {str(v) for v in context.state.get_all_message_mappings(target_channel_id).values()}
+    mapped_target_ids |= {str(v) for v in context.state.get_all_thread_message_mappings(target_channel_id).values()}
+    for mid, tgt in target_msgs.items():
+        if str(mid) in mapped_target_ids:
+            continue
+        content = (tgt.get("content") or "").strip()
+        if content == END_OF_THREAD_MARKER:
+            continue
+        stats["extra_on_target"] += 1
+        if len(stats["issues"]) < _MAX_ISSUE_DETAILS:
+            stats["issues"].append({
+                "kind": "extra_on_target",
+                "source_id": None,
+                "author": (tgt.get("author") or {}).get("username", "Unknown"),
+                "detail": f"Target message {mid} is not mapped to any Discord message",
+                "content": content[:100]
+            })
+
+    if progress_callback:
+        await progress_callback(stats)
+
+    return stats

@@ -161,6 +161,7 @@ class OperationPane(Container):
                     yield Button("Sync Server Settings", id="op_sync", disabled=True, tooltip="Sync emojis, stickers, server name, and icon to the target community")
                     yield Button("Migrate Message History", id="op_messages", disabled=True, variant="primary", tooltip="Migrate message history from Discord to the target platform")
                     yield Button("Waterfall Migration", id="op_waterfall", disabled=True, variant="primary", tooltip="Migrate all messages globally in chronological order to prevent broken links.\n(Available for Local Backups)")
+                    yield Button("Verify Migration", id="op_verify", disabled=True, tooltip="Compare a channel's Discord messages against the migrated target messages\nto check that the migration is correct")
                     yield Rule(id="footer_rule")
                     yield Button("Danger Zone ⚠", id="op_danger", variant="error", disabled=True, flat=True, tooltip="Dangerous operations:\ndelete channels, roles, emojis on target\n(use with caution)")
                 
@@ -403,7 +404,7 @@ class OperationPane(Container):
                 lbl.update(f"{t_status}")
 
             # Buttons
-            for bid in ("#op_clone", "#op_sync", "#op_messages", "#op_waterfall", "#op_danger", "#op_autotest"):
+            for bid in ("#op_clone", "#op_sync", "#op_messages", "#op_waterfall", "#op_verify", "#op_danger", "#op_autotest"):
                 for btn in self.query(bid): btn.disabled = not self.tokens_valid
 
     # ── validation ────────────────────────────────────────────────────────
@@ -424,7 +425,7 @@ class OperationPane(Container):
             
             # Disable all operation buttons while validation is in progress
             if self.view_mode == "shuttle":
-                for bid in ("#op_clone", "#op_sync", "#op_messages", "#op_waterfall", "#op_danger", "#op_autotest"):
+                for bid in ("#op_clone", "#op_sync", "#op_messages", "#op_waterfall", "#op_verify", "#op_danger", "#op_autotest"):
                     for btn in self.query(bid): btn.disabled = True
             elif self.view_mode == "backup":
                 for bid in ("#op_backup_msgs", "#op_backup_sync", "#op_autotest"):
@@ -586,6 +587,8 @@ class OperationPane(Container):
             self.run_migrate_messages()
         elif bid == "op_waterfall":
             self.run_waterfall_migration()
+        elif bid == "op_verify":
+            self.run_verify_messages()
         elif bid == "op_danger":
             self._open_danger_menu()
             
@@ -1792,6 +1795,313 @@ class OperationPane(Container):
         finally:
             self.engine.is_running = False
             await self.engine.close_connections()
+
+    # ── Migration Verification ───────────────────────────────────────────
+
+    _ISSUE_LABELS = {
+        "missing_mapping": ("[bold red]", "NOT MIGRATED"),
+        "missing_on_target": ("[bold red]", "MISSING ON TARGET"),
+        "content_mismatch": ("[bold yellow]", "CONTENT MISMATCH"),
+        "attachment_mismatch": ("[bold yellow]", "ATTACHMENT MISMATCH"),
+        "extra_on_target": ("[bold yellow]", "EXTRA ON TARGET"),
+    }
+
+    def _write_verify_result(self, modal: ProgressScreen, source_channel: Any, target_channel: Any, platform_name: str, result: Dict[str, Any]) -> int:
+        """Writes the verification summary and issue list to the modal log. Returns total issue count."""
+        issues = (
+            result["missing_mapping"] + result["missing_on_target"]
+            + result["content_mismatch"] + result["attachment_mismatch"]
+            + result["extra_on_target"]
+        )
+
+        modal.write(f"[bold cyan]Verification of Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]:[/bold cyan]")
+        modal.write(f"  Scanned: {result['scanned']} messages ({result['skipped']} skipped as not migratable, {result['target_messages']} found on target)")
+        modal.write(f"  Verified OK: [green]{result['verified']}[/green] of {result['checked']} checked")
+        modal.write(f"  Not migrated: {result['missing_mapping']} | Missing on target: {result['missing_on_target']}")
+        modal.write(f"  Content mismatches: {result['content_mismatch']} | Attachment mismatches: {result['attachment_mismatch']}")
+        modal.write(f"  Extra messages on target: {result['extra_on_target']}")
+
+        if issues == 0:
+            modal.write("[bold green]Migration is correct — no issues found.[/bold green]\n")
+        else:
+            modal.write(f"[bold red]{issues} issue(s) found:[/bold red]")
+            for issue in result["issues"][:25]:
+                color, label = self._ISSUE_LABELS.get(issue["kind"], ("[bold]", issue["kind"].upper()))
+                src_ref = f" (discord id {issue['source_id']})" if issue["source_id"] else ""
+                snippet = f" — {issue['content']}" if issue["content"] else ""
+                modal.write(f"{color}✗ {label}[/] {issue['author']}{src_ref}{snippet}\n    {issue['detail']}")
+            if issues > len(result["issues"]):
+                modal.write(f"[dim]... and {issues - len(result['issues'])} more issue(s) (details in logs).[/dim]")
+            modal.write("")
+
+        return issues
+
+    @work(exclusive=True)
+    async def run_verify_messages(self, modal: ProgressScreen | None = None) -> None:
+        await self._logic_verify_messages(modal)
+
+    async def _logic_verify_messages(self, modal: ProgressScreen | None = None) -> None:
+        if not self.tokens_valid:
+            return
+
+        migrate_mod = fluxer_migrate if self.target_platform == "fluxer" else stoat_migrate
+        platform_name = self.target_platform.capitalize()
+
+        created_modal = False
+        if not modal:
+            modal = ProgressScreen(log_level=self.config.log_level)
+            self.app.push_screen(modal)
+            created_modal = True
+            await asyncio.sleep(0.1)
+
+        try:
+            modal.show_info("[bold cyan]Migration Verification Ready[/bold cyan]", "Checking channel mappings...")
+            modal.set_status("Connecting to Servers...")
+            await self.engine.start_connections()
+
+            modal.set_status("Synchronizing entity mappings...")
+            await self._perform_auto_matching()
+
+            full_d = await self.engine.discord_reader.get_channels()
+
+            # If reading from backup, only show channels that have actual message backup data
+            if getattr(self.engine, "source_mode", "live") == "backup" and hasattr(self.engine.discord_reader, "get_backed_up_channel_ids"):
+                valid_ids = await self.engine.discord_reader.get_backed_up_channel_ids()
+                full_d = [c for c in full_d if c.id in valid_ids]
+
+            d_channels = [c for c in full_d if c.type in [self.engine.discord_reader.CHANNEL_TYPE_TEXT, self.engine.discord_reader.CHANNEL_TYPE_NEWS]]
+            d_cats = await self.engine.discord_reader.get_categories()
+            d_cat_map = {c.id: c.name for c in d_cats}
+            d_channels = order_channels_for_display(d_channels, d_cat_map)
+
+            if not d_channels:
+                modal.write("[yellow]No text channels found.[/yellow]")
+                modal.allow_close()
+                return
+
+            modal.set_status(f"Fetching {platform_name} channels...")
+            full_f = await self.engine.writer.get_channels()
+            f_channels = [c for c in full_f if str(c.get("name")).lower() not in ["reaper-logs", "reaper_logs", "reaperfiles-logs"] and c.get("type") not in [2, 4]]
+
+            if not f_channels:
+                modal.write(f"[yellow]No channels found in {platform_name} community.[/yellow]")
+                modal.allow_close()
+                await self.engine.close_connections()
+                return
+
+            if created_modal:
+                self.app.pop_screen()
+
+            target_cat_names = {str(c.get("id")): c.get("name") for c in full_f if c.get("type") == 4}
+
+            preselected_pair = None
+            preselect_src_id = None
+
+            while True:
+                if preselected_pair is not None:
+                    source_channel, target_channel = preselected_pair
+                    preselected_pair = None
+                else:
+                    loop = asyncio.get_running_loop()
+                    pick_future = loop.create_future()
+
+                    def on_pick(result):
+                        if not pick_future.done():
+                            pick_future.set_result(result)
+
+                    migrated_ids = self._collect_migrated_channel_ids(d_channels)
+                    self.app.push_screen(ChannelPickerScreen(
+                        d_channels, d_cat_map, f_channels, target_cat_names, platform_name,
+                        all_tgt_channels=full_f, preselect_src_id=preselect_src_id, migrated_ids=migrated_ids,
+                        bulk_label="Verify All Channels",
+                        bulk_tooltip="Verify every mapped text channel, one by one\n(channels without a target mapping are skipped)",
+                        bulk_value="verify_all", show_extras=False
+                    ), on_pick)
+                    preselect_src_id = None
+                    res = await pick_future
+
+                    if res is None:
+                        await self.engine.close_connections()
+                        return
+
+                    if res == "verify_all":
+                        vmodal = ProgressScreen(log_level=self.config.log_level)
+                        self.app.push_screen(vmodal)
+                        await asyncio.sleep(0.1)
+                        await self._logic_verify_all_channels(vmodal, d_channels, platform_name, migrate_mod)
+                        return
+
+                    src_id, tgt_id = res
+                    source_channel = next(c for c in d_channels if c.id == src_id)
+                    target_channel = next((c for c in f_channels if str(c.get("id")) == str(tgt_id)), None)
+                    if target_channel is None:
+                        logger.error(f"Verify: target channel {tgt_id} not found in community")
+                        continue
+
+                # Per-channel verification
+                modal = ProgressScreen(log_level=self.config.log_level)
+                self.app.push_screen(modal)
+                await asyncio.sleep(0.1)
+
+                tid = self.engine.config.fluxer_server_id if self.target_platform == "fluxer" else self.engine.config.stoat_server_id
+                tgt_server_info = await self.engine.writer.validate()
+                self.engine.ensure_state_initialized(str(tid or ""), tgt_server_info.get("community_name", "target community"))
+
+                modal.show_stats()
+                modal.phase_progress()
+                modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
+                self.engine.is_running = True
+                modal.set_status(f"Verifying: Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]")
+                modal.write(f"[bold cyan]Verifying migration:[/bold cyan] Discord [cyan]#{source_channel.name}[/cyan] → {platform_name} [green]#{target_channel.get('name')}[/green]\n")
+
+                async def update_verify(current):
+                    modal.set_item_status(f"[cyan]Checked {current['scanned']} messages...[/cyan]")
+                    modal.update_stats(
+                        messages=f"{current['verified']}/{current['checked']} OK",
+                        threads=f"{current['content_mismatch'] + current['attachment_mismatch']} mismatch",
+                        files=f"{current['missing_mapping'] + current['missing_on_target']} missing",
+                    )
+
+                result = await migrate_mod.verify_messages(
+                    self.engine,
+                    source_channel_id=source_channel.id,
+                    target_channel_id=target_channel.get("id"),
+                    progress_callback=update_verify,
+                )
+
+                issues = self._write_verify_result(modal, source_channel, target_channel, platform_name, result)
+
+                next_channel = None
+                if self.engine.is_running:
+                    next_channel = self._get_next_text_channel(d_channels, source_channel)
+                    modal.phase_report(
+                        "Verification", "complete", show_back=False,
+                        next_channel_name=next_channel.name if next_channel else None,
+                        next_button_label=f"Verify #{next_channel.name}" if next_channel else None,
+                    )
+                else:
+                    modal.phase_report("Verification", "stopped", show_back=False)
+
+                lines = [
+                    f"Verified Discord #{source_channel.name} → {platform_name} #{target_channel.get('name')}:",
+                    f"{result['verified']}/{result['checked']} messages verified OK, {issues} issue(s)",
+                    f"not migrated: {result['missing_mapping']}, missing on target: {result['missing_on_target']}, "
+                    f"content: {result['content_mismatch']}, attachments: {result['attachment_mismatch']}, extra: {result['extra_on_target']}",
+                ]
+                await log_audit_event(self.engine, "Migration Verification", "\n".join(lines))
+
+                if not self.engine.is_running or next_channel is None:
+                    return
+
+                loop = asyncio.get_running_loop()
+                modal.confirm_future = loop.create_future()
+                report_choice = await modal.confirm_future
+
+                if report_choice == "btn_next_channel":
+                    modal.dismiss()
+                    tgt_id = self.engine.state.get_target_channel_id(str(next_channel.id))
+                    matched_target = next((c for c in f_channels if str(c.get("id")) == str(tgt_id)), None) if tgt_id else None
+                    if matched_target:
+                        preselected_pair = (next_channel, matched_target)
+                    else:
+                        preselect_src_id = next_channel.id
+                    continue
+                elif report_choice == "btn_back":
+                    modal.dismiss()
+                    continue
+                else:
+                    modal.dismiss()
+                    return
+
+        except Exception as e:
+            modal.write(f"[bold red]Error: {e}[/bold red]")
+            modal.phase_report("Verification", "error", show_back=False)
+            logger.error(f"Verification Error: {traceback.format_exc()}")
+        finally:
+            self.engine.is_running = False
+            await self.engine.close_connections()
+
+    async def _logic_verify_all_channels(self, modal: ProgressScreen, d_channels: list, platform_name: str, migrate_mod) -> None:
+        """Verifies every mapped text channel one by one and reports a summary."""
+        modal.show_info("[bold cyan]Bulk Channel Verification[/bold cyan]", f"Verifying all {len(d_channels)} mapped text channels, one by one.")
+        modal.show_stats()
+        modal.phase_progress()
+        modal.cancel_callback = lambda: setattr(self.engine, "is_running", False)
+
+        # Ensure state database exists for mapping lookups
+        tid = self.engine.config.fluxer_server_id if self.target_platform == "fluxer" else self.engine.config.stoat_server_id
+        tgt_server_info = await self.engine.writer.validate()
+        self.engine.ensure_state_initialized(str(tid or ""), tgt_server_info.get("community_name", "target community"))
+
+        modal.write(f"[bold cyan]Bulk Verification: checking {len(d_channels)} text channels.[/bold cyan]\n")
+
+        clean_channels, skipped, channels_with_issues, total_issues = 0, 0, 0, 0
+        self.engine.is_running = True
+
+        for i, source_channel in enumerate(d_channels):
+            if not self.engine.is_running:
+                modal.write("\n[bold yellow]Bulk verification interrupted by user.[/bold yellow]")
+                break
+
+            tgt_id = self.engine.state.get_target_channel_id(str(source_channel.id))
+            if not tgt_id:
+                skipped += 1
+                modal.write(f"[yellow]Skipping #{source_channel.name} (no target mapping found)[/yellow]")
+                continue
+
+            modal.write(f"\n[bold cyan]Verifying {i + 1}/{len(d_channels)}:[/bold cyan] Discord [cyan]#{source_channel.name}[/cyan]")
+            modal.set_status(f"Verifying [cyan]#{source_channel.name}[/cyan] ({i + 1}/{len(d_channels)})")
+
+            async def update_verify(current, ch_name=source_channel.name):
+                modal.set_item_status(f"[cyan]#{ch_name}: checked {current['scanned']} messages...[/cyan]")
+                modal.update_stats(
+                    messages=f"{current['verified']}/{current['checked']} OK",
+                    threads=f"{current['content_mismatch'] + current['attachment_mismatch']} mismatch",
+                    files=f"{current['missing_mapping'] + current['missing_on_target']} missing",
+                )
+
+            try:
+                result = await migrate_mod.verify_messages(
+                    self.engine,
+                    source_channel_id=source_channel.id,
+                    target_channel_id=tgt_id,
+                    progress_callback=update_verify,
+                )
+            except Exception as e:
+                modal.write(f"[bold red]Error verifying #{source_channel.name}: {e}[/bold red]")
+                logger.error(f"Verification error on #{source_channel.name}: {traceback.format_exc()}")
+                continue
+
+            issues = (
+                result["missing_mapping"] + result["missing_on_target"]
+                + result["content_mismatch"] + result["attachment_mismatch"]
+                + result["extra_on_target"]
+            )
+            total_issues += issues
+            if issues > 0:
+                channels_with_issues += 1
+                modal.write(f"[red]#{source_channel.name}: {issues} issue(s) — {result['verified']} OK of {result['checked']} checked[/red]")
+            else:
+                clean_channels += 1
+                modal.write(f"[green]#{source_channel.name}: OK ({result['checked']} messages verified)[/green]")
+
+        interrupted = not self.engine.is_running
+        if not interrupted:
+            modal.write(f"\n[bold]Bulk Verification Summary:[/bold]")
+            modal.write(f"  Channels verified OK: [green]{clean_channels}[/green]")
+            modal.write(f"  Channels with issues: [red]{channels_with_issues}[/red] ({total_issues} issue(s) total)")
+            modal.write(f"  Channels skipped (no mapping): [yellow]{skipped}[/yellow]")
+            if total_issues == 0 and channels_with_issues == 0:
+                modal.write("[bold green]All mapped channels migrated correctly.[/bold green]")
+
+        status = "stopped" if interrupted else "complete"
+        modal.phase_report("Bulk Verification", status, show_back=False)
+
+        lines = [
+            f"Bulk verification of {len(d_channels)} channels:",
+            f"{clean_channels} OK, {channels_with_issues} with issues ({total_issues} total), {skipped} skipped",
+        ]
+        await log_audit_event(self.engine, "Migration Verification", "\n".join(lines))
 
     @work(exclusive=True)
     async def run_waterfall_migration(self, modal: ProgressScreen | None = None) -> None:
